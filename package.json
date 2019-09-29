@@ -9,10 +9,9 @@
   "author": "Bryan Veer",
   "license": "ISC",
   "dependencies": {
-    "axios": "^0.19.0",
     "binance-api-node": "^0.9.5",
     "dotenv": "^8.1.0",
-    "gridfs-stream": "^1.1.1",
-    "mongoose": "^5.7.1"
+    "pg": "^7.12.1",
+    "pg-format": "^1.0.4"
   }
 }

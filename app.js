@@ -1,21 +1,17 @@
-const mongoose = require('mongoose');
+require('dotenv').config();
+
 const binance = require('binance-api-node').default;
-let Symbols = require('./models/symbol.model');
 const intervalToMs = require('./utils/interval-to-ms.util');
 
+const { Client } = require('pg');
+const pgFormat = require('pg-format');
+const pgClient = new Client({
+  connectionString: process.env.PG_URL
+});
+
+pgClient.connect();
+
 const bClient = binance();
-
-mongoose.set('useNewUrlParser', true);
-mongoose.set('useFindAndModify', false);
-mongoose.set('useCreateIndex', true);
-mongoose.set('useUnifiedTopology', true);
-
-mongoose.connect('mongodb://localhost/binance');
-mongoose.connection
-  .once('open', () => console.log('Database successfully connected!'))
-  .on('error', err => {
-    if (err) throw err;
-  });
 
 async function fillDB(...args) {
   const params = ['symbol', 'interval', 'limit', 'startTime', 'endTime'];
@@ -26,64 +22,89 @@ async function fillDB(...args) {
     options[params[i]] = args[i];
   }
 
-  // does data for a symbol already exist?
-  const result = await Symbols.exists({ symbol: options['symbol'] });
-
+  // get the data from binance
   const data = await bClient.candles(options);
 
   return new Promise((resolve, reject) => {
-    if (result) {
-      // if it does exist, find it and update it with new price data
-      Symbols.findOneAndUpdate(
-        { symbol: options['symbol'] },
-        { $push: { [args[1]]: data } },
-        { safe: true, upsert: true, new: true },
-        (err, doc) => {
-          if (err) return reject(`There was an error: ${err}`);
-          resolve(doc.length);
-        }
-      );
-    } else {
-      // otherwise make a new symbol collection and save it
-      const symbol = new Symbols({
-        symbol: options['symbol'],
-        [args[1]]: data
-      });
+    const values = data.map(obj => [
+      obj.openTime,
+      obj.open,
+      obj.high,
+      obj.low,
+      obj.close,
+      obj.volume,
+      obj.closeTime,
+      obj.quoteVolume,
+      obj.trades,
+      obj.baseAssetVolume,
+      obj.quoteAssetVolume
+    ]);
 
-      symbol
-        .save()
-        .then(doc => resolve(doc.length))
-        .catch(err => reject(`There was an error: ${err}`));
-    }
+    pgClient
+      .query(
+        pgFormat(
+          `INSERT INTO %s (open_time, open, high, low, close, volume, close_time, quote_asset_volume, trades, taker_base_volume, taker_quote_volume)
+    VALUES %L`,
+          String(args[0] + '_' + args[1]).toLowerCase(),
+          values
+        )
+      )
+      .then(res => resolve(res))
+      .catch(err => reject(err));
   });
 }
 
 async function getData(...args) {
+  console.log(`Checking price data...`);
+
   // check for oldest entry on record
   const oldest = await bClient.candles({ symbol: args[0], interval: args[1], limit: 1, startTime: 0 });
   const time = oldest ? oldest[0].openTime : null;
 
-  // make sure we get a proper response before attempting
+  // make sure we get the oldest available record first
   if (time) {
     const rateLimit = 500;
     const waitTime = 800;
     const curDate = Date.now();
     const diff = Math.floor((curDate - time) / intervalToMs(args[1]));
 
-    // const pipeline = [{ $match: { symbol: args[0] } }, { $unwind: `$${args[1]}` }, { $count: 'count' }];
-    const pipeline = [
-      { $match: { symbol: args[0] } },
-      { $project: { symbols: { $size: `$${args[1]}` } } },
-      { $group: { _id: null, count: { $sum: '$symbols' } } }
-    ];
+    const tableName = String(args[0] + '_' + args[1]).toLowerCase();
 
-    const result = await Symbols.aggregate(pipeline);
-    let count = result.length ? result[0].count : 0;
+    // check if table already exists
+    const isTable = await pgClient.query(pgFormat(`SELECT to_regclass('%s');`, tableName));
 
-    console.log('Checking price data...');
+    // if it doesnt, create it and fill with initial data
+    if (!isTable.rows[0].to_regclass) {
+      console.log('No historical data found. Creating new table...');
+      await pgClient.query(
+        pgFormat(
+          `CREATE TABLE %s (
+        id BIGSERIAL NOT NULL PRIMARY KEY,
+        open_time BIGINT NOT NULL,
+        open NUMERIC(20,8) NOT NULL,
+        high NUMERIC(20,8) NOT NULL,
+        low NUMERIC(20,8) NOT NULL,
+        close NUMERIC(20,8) NOT NULL,
+        volume NUMERIC(20,8) NOT NULL,
+        close_time BIGINT NOT NULL,
+        quote_asset_volume NUMERIC(20,8) NOT NULL,
+        trades INTEGER NOT NULL,
+        taker_base_volume NUMERIC(20,8) NOT NULL,
+        taker_quote_volume NUMERIC(20,8) NOT NULL
+      )`,
+          tableName
+        )
+      );
+
+      await fillDB(args[0], args[1], rateLimit, time);
+    }
+
+    // get number of items in a table
+    let query = await pgClient.query(pgFormat(`SELECT * FROM %s`, tableName));
+    let count = query.rowCount;
 
     while (diff > count) {
-      // find count of candlesticks for specified symbol and interval
+      // fill DB until up-to-date
       process.stdout.clearLine();
       process.stdout.cursorTo(0);
       process.stdout.write(`Remaining: ${diff - count}`);
@@ -91,15 +112,18 @@ async function getData(...args) {
       await fillDB(args[0], args[1], rateLimit, count * intervalToMs(args[1]) + time);
 
       count += rateLimit;
+      // wait before each subsequent request
       await sleep(waitTime);
     }
 
-    process.stdout.write('\n'); // end the line
+    query = await pgClient.query(pgFormat(`SELECT * FROM %s`, tableName));
+    count = query.rowCount;
 
-    // TODO: Subscribe to price changes of individual intervals and automatically update data
-    console.log(`Price data OK!`);
+    process.stdout.write(`\nTotal entries: ${count}\n`);
+
+    // TODO: Subscribe to price changes of individual intervals and automatically update DB data
   } else {
-    throw new Error("ERROR: Couldn't check historical data (Invalid response)");
+    throw new Error('ERROR: Check for oldest remote record failed (Invalid response)');
   }
 }
 
@@ -112,5 +136,3 @@ function sleep(x) {
 }
 
 getData('BTCUSDT', '5m');
-
-// fillDB('BTCUSDT', '1d', 100, 0);
