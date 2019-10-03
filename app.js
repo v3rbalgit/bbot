@@ -49,7 +49,13 @@ async function fillDB(...args) {
           values
         )
       )
-      .then(res => resolve(res))
+      .then(() => {
+        // get number of items in a table
+        pgClient.query(pgFormat(`SELECT * FROM %s`, String(args[0] + '_' + args[1]).toLowerCase())).then(res => {
+          let count = res.rowCount;
+          resolve(count);
+        });
+      })
       .catch(err => reject(err));
   });
 }
@@ -57,14 +63,16 @@ async function fillDB(...args) {
 async function getData(...args) {
   console.log(`Checking price data...`);
 
+  const rateLimit = 500;
+  const waitTime = 800;
+  let count = 0;
+
   // check for oldest entry on record
   const oldest = await bClient.candles({ symbol: args[0], interval: args[1], limit: 1, startTime: 0 });
   const time = oldest ? oldest[0].openTime : null;
 
-  // make sure we get the oldest available record first
+  // need the most recent candle to proceed
   if (time) {
-    const rateLimit = 500;
-    const waitTime = 800;
     const curDate = Date.now();
     const diff = Math.floor((curDate - time) / intervalToMs(args[1]));
 
@@ -96,12 +104,12 @@ async function getData(...args) {
         )
       );
 
-      await fillDB(args[0], args[1], rateLimit, time);
+      count = await fillDB(args[0], args[1], rateLimit, time);
     }
 
-    // get number of items in a table
-    let query = await pgClient.query(pgFormat(`SELECT * FROM %s`, tableName));
-    let count = query.rowCount;
+    // get number of items in the table
+    const query = await pgClient.query(pgFormat(`SELECT * FROM %s`, tableName));
+    count = query.rowCount;
 
     while (diff > count) {
       // fill DB until up-to-date
@@ -109,21 +117,28 @@ async function getData(...args) {
       process.stdout.cursorTo(0);
       process.stdout.write(`Remaining: ${diff - count}`);
 
-      await fillDB(args[0], args[1], rateLimit, count * intervalToMs(args[1]) + time);
-
-      count += rateLimit;
+      count = await fillDB(args[0], args[1], rateLimit, count * intervalToMs(args[1]) + time);
       // wait before each subsequent request
       await sleep(waitTime);
     }
 
-    query = await pgClient.query(pgFormat(`SELECT * FROM %s`, tableName));
-    count = query.rowCount;
+    process.stdout.clearLine();
+    process.stdout.cursorTo(0);
+    process.stdout.write(`Total entries: ${count}\n`);
 
-    process.stdout.write(`\nTotal entries: ${count}\n`);
-
-    // TODO: Subscribe to price changes of individual intervals and automatically update DB data
+    // real-time database updates
+    bClient.ws.candles(args[0], args[1], async candle => {
+      if (candle.isFinal) {
+        await fillDB(args[0], args[1], 1, count * intervalToMs(args[1]) + time);
+        count++;
+        console.log(`\nNew candle!`);
+      }
+      process.stdout.clearLine();
+      process.stdout.cursorTo(0);
+      process.stdout.write(`Current price: ${Number(candle.close).toFixed(2)}`);
+    });
   } else {
-    throw new Error('ERROR: Check for oldest remote record failed (Invalid response)');
+    throw new Error('E: Unable to retrieve oldest remote record');
   }
 }
 
