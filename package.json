@@ -9,7 +9,7 @@
   "author": "Bryan Veer",
   "license": "ISC",
   "dependencies": {
-    "binance-api-node": "^0.9.5",
+    "binance-api-node": "^0.12.4",
     "dotenv": "^8.1.0",
     "pg": "^7.12.1",
     "pg-format": "^1.0.4"
